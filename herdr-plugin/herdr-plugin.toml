@@ -1,0 +1,23 @@
+id = "joeharris76.px0-opener"
+name = "px0 Opener"
+version = "1.0.0"
+min_herdr_version = "0.7.0"
+description = "Open clicked px0:// and file:// links in the px0 file browser."
+platforms = ["macos"]
+
+[[actions]]
+id = "open"
+title = "Open link in px0"
+command = ["bash", "open.sh"]
+
+[[link_handlers]]
+id = "px0-scheme"
+title = "Open px0 link in px0"
+pattern = "(?i)^px0://"
+action = "open"
+
+[[link_handlers]]
+id = "file-url"
+title = "Open file URL in px0"
+pattern = "(?i)^file://"
+action = "open"
