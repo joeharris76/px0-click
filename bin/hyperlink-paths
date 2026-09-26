@@ -65,7 +65,9 @@ PATH_RE = re.compile(
     # never become a hyperlink to the filesystem root.
     r"(?:/(?:" + SEG + r"|" + BRK + r")+"
     r"(?: (?![A-Za-z]+://|\.{0,2}/|~/)(?:" + SEG + r"|" + BRK + r")+){0," + str(MAX_SPACE_SEGMENTS) + r"})"
-    r"|(?:~|\.{1,2}|\$[A-Za-z_]\w*|\.[\w][\w\-.]*|[\w][\w\-.]*)(?:/(?:" + SEG + r"|" + BRK + r")*)+"
+    # A relative candidate starts only at a token boundary. Without this
+    # guard, a long slash-free word retries the greedy prefix at every byte.
+    r"|(?<![\w.~$-])(?:~|\.{1,2}|\$[A-Za-z_]\w*|\.[\w][\w\-.]*|[\w][\w\-.]*)(?:/(?:" + SEG + r"|" + BRK + r")*)+"
     r"(?: (?![A-Za-z]+://|\.{0,2}/|~/)(?:" + SEG + r"|" + BRK + r")+){0," + str(MAX_SPACE_SEGMENTS) + r"}"
     r")"
     r"(?P<trailer>:[0-9]+(?::[0-9]+)?)?"
@@ -81,12 +83,33 @@ TRAILING_PUNCT = ".,:;!?)]}"
 # the plain runs keeps colors intact while making the paths clickable.
 # OSC 8 hyperlinks (ESC]...ESC\\) contain no CSI opener and pass through
 # as glued tokens that the control-byte guard preserves byte-identical.
-ANSI_CSI_RE = re.compile(r"(\x1b\[[0-9;?]*[ -/]*[@-~])")
+ANSI_CSI_RE = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
 
-# Zero-width placeholder standing in for one ANSI CSI run while matching.
-# It lives in the Unicode private-use area so it cannot collide with real
-# path text; runs are restored verbatim before output.
-ANSI_RUN_PLACEHOLDER = "\ue000"
+# Seed for a zero-width placeholder standing in for one ANSI CSI run while
+# matching. A placeholder absent from each input line is selected dynamically,
+# because private-use characters are still valid literal path/text bytes.
+ANSI_RUN_PLACEHOLDER_SEED = "\ue000"
+
+
+def choose_ansi_placeholder(line):
+    """Return a private-use string that does not occur in line."""
+    used = set(line)
+    for start, stop in ((0xE000, 0xF900), (0xF0000, 0xFFFFE), (0x100000, 0x10FFFE)):
+        for codepoint in range(start, stop):
+            candidate = chr(codepoint)
+            if candidate not in used:
+                return candidate
+
+    # Pathological fallback for a line containing every private-use scalar:
+    # one more seed character than its longest existing run cannot collide.
+    longest = current = 0
+    for char in line:
+        if char == ANSI_RUN_PLACEHOLDER_SEED:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return ANSI_RUN_PLACEHOLDER_SEED * (longest + 1)
 
 
 def strip_trailing_punct(token):
@@ -95,7 +118,7 @@ def strip_trailing_punct(token):
     return stripped, token[len(stripped):]
 
 
-def split_line_suffix(path):
+def split_line_suffix(path, ansi_placeholder=None):
     """Split path into (path, line, col, rest).
 
     Handles trailing :line, :line:col, and :line:col:text suffixes, so
@@ -103,18 +126,18 @@ def split_line_suffix(path):
     location in the link while the match text stays plain. rest is the
     trailing ":text" portion ("" when absent).
 
-    ANSI_RUN_PLACEHOLDER runs (folded CSI escapes, see linkify_line) are
+    ansi_placeholder runs (folded CSI escapes, see linkify_line) are
     allowed around the structural colons so colorized separators
     ("pathESC[0m:ESC[32m10ESC[0m") still parse; they stay in the returned
     strings (skeleton space) and are stripped by resolve() for the URI.
     """
-    ph = ANSI_RUN_PLACEHOLDER
     # Every structural colon tolerates surrounding folded CSI runs
     # ("pathESC[0m:ESC[32m10ESC[0m"); captured line/col stay pure digits.
-    sep = ph + "*:"
+    padding = "(?:" + re.escape(ansi_placeholder) + ")*" if ansi_placeholder else ""
+    sep = padding + ":"
     m = re.match(
-        r"^(?P<p>.*?)" + sep + ph + r"*(?P<line>[0-9]+)"
-        r"(?:" + sep + ph + r"*(?P<col>[0-9]+)(?P<rest>" + sep + r".+)?|(?P<rest2>" + sep + r".+)?)$",
+        r"^(?P<p>.*?)" + sep + padding + r"(?P<line>[0-9]+)"
+        r"(?:" + sep + padding + r"(?P<col>[0-9]+)(?P<rest>" + sep + r".+)?|(?P<rest2>" + sep + r".+)?)$",
         path,
     )
     if m:
@@ -128,11 +151,36 @@ def split_line_suffix(path):
     return path, None, None, ""
 
 
-def resolve(candidate, base):
+def split_longest_existing_location(path, base, ansi_placeholder=None):
+    """Prefer the longest existing numeric-suffix filename before a location."""
+    padding = "(?:" + re.escape(ansi_placeholder) + ")*" if ansi_placeholder else ""
+    sep = padding + ":" + padding
+    patterns = (
+        (r"^(?P<p>.+)" + sep + r"(?P<line>[0-9]+)(?P<rest>" + sep + r".+)?$", None),
+        (
+            r"^(?P<p>.+)" + sep + r"(?P<line>[0-9]+)" + sep
+            + r"(?P<col>[0-9]+)(?P<rest>" + sep + r".+)?$",
+            "col",
+        ),
+    )
+    for pattern, col_group in patterns:
+        match = re.match(pattern, path)
+        if not match:
+            continue
+        candidate = match.group("p")
+        absolute = resolve(candidate, base, ansi_placeholder)
+        if absolute is not None and os.path.exists(absolute):
+            col = match.group(col_group) if col_group else None
+            return candidate, match.group("line"), col, match.group("rest") or "", absolute
+    return None
+
+
+def resolve(candidate, base, ansi_placeholder=None):
     """Resolve a candidate token against base; return absolute path or None."""
     # Strip folded ANSI placeholders (see linkify_line): matching happens
     # in skeleton space, but the filesystem never sees them.
-    candidate = candidate.replace(ANSI_RUN_PLACEHOLDER, "")
+    if ansi_placeholder:
+        candidate = candidate.replace(ansi_placeholder, "")
     if candidate.startswith("~"):
         candidate = os.path.expanduser(candidate)
     elif candidate.startswith("$"):
@@ -141,7 +189,7 @@ def resolve(candidate, base):
         if not value:
             return None
         candidate = value + ("/" + rest if rest else "")
-    elif not os.path.isabs(candidate):
+    if not os.path.isabs(candidate):
         candidate = os.path.join(base, candidate)
     return os.path.normpath(candidate)
 
@@ -171,11 +219,12 @@ def linkify_line(line, base, check_exists):
     runs = ANSI_CSI_RE.split(line)
     if len(runs) == 1:
         return _linkify_run(line, base, check_exists)
-    skeleton = ANSI_RUN_PLACEHOLDER.join(
+    ansi_placeholder = choose_ansi_placeholder(line)
+    skeleton = ansi_placeholder.join(
         runs[i] for i in range(0, len(runs), 2)
     )
-    linked = _linkify_run(skeleton, base, check_exists)
-    parts = linked.split(ANSI_RUN_PLACEHOLDER)
+    linked = _linkify_run(skeleton, base, check_exists, ansi_placeholder)
+    parts = linked.split(ansi_placeholder)
     out = []
     for i, part in enumerate(parts):
         out.append(part)
@@ -184,20 +233,45 @@ def linkify_line(line, base, check_exists):
     return "".join(out)
 
 
-def _linkify_run(line, base, check_exists):
+def _has_visible_text(text, ansi_placeholder):
+    if ansi_placeholder:
+        text = text.replace(ansi_placeholder, "")
+    return bool(text.strip())
+
+
+def _linkify_run(line, base, check_exists, ansi_placeholder=None):
     out = []
     pos = 0
     for m in PATH_RE.finditer(line):
         token = m.group("path") + (m.group("trailer") or "")
+
+        # Before interpreting punctuation or a numeric tail as syntax, prefer
+        # an exact existing filename. Temporarily peel folded ANSI runs from
+        # the edge so they remain outside the link when restored.
+        exact_token = token
+        exact_punct = ""
+        while ansi_placeholder and exact_token.endswith(ansi_placeholder):
+            exact_token = exact_token[:-len(ansi_placeholder)]
+            exact_punct = ansi_placeholder + exact_punct
+        if (check_exists and exact_token
+                and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in exact_token)):
+            exact_abs = resolve(exact_token, base, ansi_placeholder)
+            if exact_abs is not None and os.path.exists(exact_abs):
+                out.append(line[pos:m.start()])
+                uri = hyperlink_target(exact_abs, None, None)
+                out.append(OSC8_OPEN_FMT.format(uri=uri) + exact_token + OSC8_CLOSE + exact_punct)
+                pos = m.end()
+                continue
+
         token, punct = strip_trailing_punct(token)
         # Folded ANSI placeholders at the token edge belong to the
         # surrounding runs, not the path: move trailing ones to punct so
         # end-anchored :line parsing sees a clean boundary. Order is
         # preserved for verbatim restore. (A match never starts with a
         # placeholder: no PATH_RE branch opens with one.)
-        while token.endswith(ANSI_RUN_PLACEHOLDER):
-            token = token[: -len(ANSI_RUN_PLACEHOLDER)]
-            punct = ANSI_RUN_PLACEHOLDER + punct
+        while ansi_placeholder and token.endswith(ansi_placeholder):
+            token = token[:-len(ansi_placeholder)]
+            punct = ansi_placeholder + punct
         if not token:
             continue
         if any(ord(c) < 0x20 or ord(c) == 0x7F for c in token):
@@ -206,8 +280,14 @@ def _linkify_run(line, base, check_exists):
             # into one token) never appear in clickable paths. Leave the
             # original bytes untouched so existing hyperlinks survive.
             continue
-        body, line_no, col_no, suffix_rest = split_line_suffix(token)
-        abs_path = resolve(body, base)
+        longest_location = None
+        if check_exists:
+            longest_location = split_longest_existing_location(token, base, ansi_placeholder)
+        if longest_location is not None:
+            body, line_no, col_no, suffix_rest, abs_path = longest_location
+        else:
+            body, line_no, col_no, suffix_rest = split_line_suffix(token, ansi_placeholder)
+            abs_path = resolve(body, base, ansi_placeholder)
         if abs_path is None:
             continue
         if not check_exists or os.path.exists(abs_path):
@@ -216,7 +296,9 @@ def _linkify_run(line, base, check_exists):
                 # the link, leave the match text plain.
                 token = token[: len(token) - len(suffix_rest)]
                 punct = suffix_rest + punct
-            elif not check_exists and " " in token:
+            elif (not check_exists and " " in token
+                  and (_has_visible_text(line[:m.start()], ansi_placeholder)
+                       or _has_visible_text(line[m.end():], ansi_placeholder))):
                 # Without the exists-check there is no longest-existing
                 # prefix to trim back to, so a greedy space run would
                 # swallow trailing prose into the URI. Trim back to the
@@ -232,8 +314,8 @@ def _linkify_run(line, base, check_exists):
                     # One separator space (token/prose boundary); the old
                     # punct stays glued as it was (e.g. "here.").
                     punct = " " + " ".join(words[cut + 1 :]) + punct
-                    body, line_no, col_no, suffix_rest = split_line_suffix(token)
-                    abs_path = resolve(body, base)
+                    body, line_no, col_no, suffix_rest = split_line_suffix(token, ansi_placeholder)
+                    abs_path = resolve(body, base, ansi_placeholder)
                     if suffix_rest:
                         token = token[: len(token) - len(suffix_rest)]
                         punct = suffix_rest + punct
@@ -244,7 +326,7 @@ def _linkify_run(line, base, check_exists):
             # with the number kept as literal path text: the longest
             # existing space-prefix then keeps the full visible text.
             alt_body = body + (":" + line_no if line_no else "") + (":" + col_no if col_no else "")
-            alt_abs = resolve(alt_body, base)
+            alt_abs = resolve(alt_body, base, ansi_placeholder)
             if alt_abs is not None and os.path.exists(alt_abs):
                 body, abs_path = alt_body, alt_abs
                 line_no, col_no, suffix_rest = None, None, ""
@@ -275,8 +357,8 @@ def _linkify_run(line, base, check_exists):
                     p_stripped, p_punct = strip_trailing_punct(prefix)
                     if not p_stripped:
                         continue
-                    p_body, p_line, p_col, p_suffix = split_line_suffix(p_stripped)
-                    p_abs = resolve(p_body, base)
+                    p_body, p_line, p_col, p_suffix = split_line_suffix(p_stripped, ansi_placeholder)
+                    p_abs = resolve(p_body, base, ansi_placeholder)
                     if p_abs is not None and os.path.exists(p_abs):
                         # The :line:col:text suffix stays out of the visible
                         # link; only path:line:col is underlined.
@@ -284,7 +366,7 @@ def _linkify_run(line, base, check_exists):
                         # The trimmed remainder may hold more paths ("a /etc/hosts
                         # and b src/main.py"); rescan it rather than emitting plain.
                         after = p_suffix + p_punct + raw_rest
-                        rescanned = linkify_line(after, base, check_exists) if after else ""
+                        rescanned = _linkify_run(after, base, check_exists, ansi_placeholder) if after else ""
                         hit = (link_text, p_abs, p_line, p_col, rescanned)
                         break
                 if hit is None:

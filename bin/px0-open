@@ -2,16 +2,15 @@
 # px0-open: open a file path or px0:///file URL in the px0 file browser.
 #
 # Usage:
-#   px0-open <path>[:line[:col]]     open a filesystem path in px0
+#   px0-open <path>[:line[:col]]       open a filesystem path in px0
 #   px0-open 'px0:///abs/path?line=N'  open a px0:// URL (from OSC 8 clicks)
-#   px0-open 'file:///abs/path'        open a file:// URL in px0
-#   px0-open -- <target>               open a target starting with -
+#   px0-open 'file:///abs/path'         open a local file:// URL in px0
+#   px0-open -- <target>                open a target starting with -
 #
 # Accepts absolute paths, ~/ paths, and paths relative to the current
-# directory. A trailing :line or :line:col suffix is stripped because the
-# px0 CLI takes a file or directory argument. The px0 server is launched
-# detached so click handlers return immediately; px0 opens the browser
-# itself unless configured otherwise.
+# directory. Numeric line/column locations are preserved in px0's documented
+# path:line:column form. The px0 server is launched detached so click handlers
+# return immediately; px0 opens the browser itself unless configured otherwise.
 set -u
 
 PX0_BIN="${PX0_BIN:-$HOME/.local/bin/px0}"
@@ -19,55 +18,19 @@ PX0_BIN="${PX0_BIN:-$HOME/.local/bin/px0}"
 # per-app TMPDIR, so $TMPDIR would scatter logs unpredictably.
 LOG_DIR="${PX0_OPEN_LOG_DIR:-$HOME/.local/state/px0-open}"
 LOG_FILE="$LOG_DIR/px0-open.log"
-# Every click appends px0's startup narration, so trim the log back to a
-# bounded tail on each run instead of growing it without limit.
+# Each detached px0 process writes through a short relay that reopens the shared
+# log for every chunk. Relays serialize append and compaction with a file lock,
+# so the log stays bounded without unlinking an inode that a live px0 owns.
 LOG_MAX_BYTES=131072
 LOG_KEEP_BYTES=65536
-
-trim_log() {
-    local size tmp
-    [[ -f "$LOG_FILE" ]] || return 0
-    size="$(wc -c <"$LOG_FILE" 2>/dev/null | tr -d ' ' || echo 0)"
-    if [[ "$size" -gt "$LOG_MAX_BYTES" ]]; then
-        # Unique temp file per process: rapid-click bursts trim
-        # concurrently without sharing one fixed filename. cat (not mv)
-        # back into place because this shell may already hold LOG_FILE
-        # open via the non-terminal exec redirect above; a rename would
-        # leave it writing to an unlinked inode.
-        tmp="$(mktemp "${LOG_FILE%/*}/px0-open.XXXXXX")" || return 0
-        # Drop to the first full line so a byte cut through a multibyte
-        # UTF-8 sequence or escape code never leaves a broken seam.
-        if tail -c "$LOG_KEEP_BYTES" "$LOG_FILE" 2>/dev/null | tail -n +2 >"$tmp"; then
-            cat "$tmp" >"$LOG_FILE" 2>/dev/null || true
-        fi
-        rm -f "$tmp"
-    fi
-}
-
-# When launched by LaunchServices as a URL handler, stdout is a pipe with
-# no reader: writing to it blocks forever and leaves the handler instance
-# hanging, which swallows later clicks (verified: a bash-script handler
-# binary stuck on such a write and ate subsequent open events). Redirect to
-# the log only when stdout is not a terminal AND stderr is not a terminal
-# either: an explicit user pipe (`px0-open x | cat`) still has a live
-# reader, and diagnostics must stay visible. (main.swift additionally sends
-# the handler child's stdio to /dev/null, so the redirect below is a
-# backstop for Herdr actions and other non-terminal callers.)
-if [[ ! -t 1 && ! -t 2 ]]; then
-    mkdir -p "$LOG_DIR" 2>/dev/null || true
-    exec >>"$LOG_FILE" 2>&1
-fi
 
 usage() {
     # Header comment doubles as help: lines 2+ while they start with '#'.
     awk 'NR<2{next} /^(#|$)/{sub(/^# ?/,""); print; next} {exit}' "$0"
 }
 
-# Percent-decode a URI component. Resolved lazily because URL handlers
-# (LaunchServices, Herdr actions) run with a minimal PATH. Never fails:
-# when no python is usable the raw string passes through unchanged.
-urldecode() {
-    local py="${PX0_PYTHON:-}"
+find_python() {
+    local py="${PX0_PYTHON:-}" cand
     if [[ -n "$py" && ! -x "$py" ]]; then
         py=""
     fi
@@ -82,57 +45,214 @@ urldecode() {
             fi
         done
     fi
+    printf '%s' "$py"
+}
+
+launch_px0() {
+    local target="$1" launch_log="$2" py
+    py="$(find_python)"
     if [[ -z "$py" ]]; then
-        printf '%s' "$1"
-        return 0
+        printf 'px0-open: python3 is required to launch px0 safely\n' >&2
+        return 1
     fi
-    "$py" -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.unquote(sys.argv[1]))' "$1" 2>/dev/null || printf '%s' "$1"
+    "$py" - "$PX0_BIN" "$target" "$launch_log" "$LOG_MAX_BYTES" "$LOG_KEEP_BYTES" <<'PY'
+import fcntl
+import os
+import subprocess
+import sys
+
+binary, target, log_path, max_bytes, keep_bytes = sys.argv[1:]
+max_bytes = int(max_bytes)
+keep_bytes = int(keep_bytes)
+
+
+def relay_output(stream):
+    lock_path = log_path + ".lock"
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    null_fd = os.open(os.devnull, os.O_RDWR)
+    for descriptor in (0, 1, 2):
+        os.dup2(null_fd, descriptor)
+    if null_fd > 2:
+        os.close(null_fd)
+
+    def append_bounded(chunk):
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(lock_path, "a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if chunk:
+                with open(log_path, "ab", buffering=0) as destination:
+                    destination.write(chunk)
+            try:
+                size = os.path.getsize(log_path)
+            except FileNotFoundError:
+                return
+            if size <= max_bytes:
+                return
+            with open(log_path, "rb") as source:
+                start = max(0, size - keep_bytes)
+                source.seek(start)
+                retained = source.read(size - start)
+            if start:
+                newline = retained.find(b"\n")
+                retained = retained[newline + 1:] if newline >= 0 else b""
+            temporary = f"{log_path}.compact.{os.getpid()}"
+            try:
+                with open(temporary, "wb", buffering=0) as destination:
+                    destination.write(retained)
+                os.replace(temporary, log_path)
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+    try:
+        append_bounded(b"")
+        while True:
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                break
+            append_bounded(chunk)
+    finally:
+        stream.close()
+        os._exit(0)
+
+
+try:
+    if log_path == "/dev/null":
+        subprocess.Popen(
+            [binary, target],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    else:
+        process = subprocess.Popen(
+            [binary, target],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+        relay_pid = os.fork()
+        if relay_pid == 0:
+            relay_output(process.stdout)
+        process.stdout.close()
+except FileNotFoundError as error:
+    print(f"px0-open: px0 failed to start: {error}", file=sys.stderr)
+    raise SystemExit(127)
+except PermissionError as error:
+    print(f"px0-open: px0 failed to start: {error}", file=sys.stderr)
+    raise SystemExit(126)
+except OSError as error:
+    print(f"px0-open: px0 failed to start: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
-# Parse a px0:// or file:// URL into an absolute filesystem path.
-# Prints the path on stdout. Query strings (?line=N) and fragments are
-# dropped; a host component (file://host/path, px0://host/path) is dropped.
-url_to_path() {
-    local url="$1" rest path
-    rest="${url#*://}"
-    rest="${rest%%\?*}"
-    rest="${rest%%\#*}"
-    if [[ "$rest" == /* ]]; then
-        path="$rest"
+has_control_bytes() {
+    local value="$1" py="$2"
+    if [[ -n "$py" ]]; then
+        "$py" -c '
+import os
+import sys
+
+value = os.fsencode(sys.argv[1])
+raise SystemExit(0 if any(byte < 0x20 or byte == 0x7f for byte in value) else 1)
+' "$value" 2>/dev/null
+        return $?
+    fi
+    case "$value" in
+        *$'\n'*|*$'\r'*|*$'\t'*|*$'\033'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Percent-decode a URI component into the named variable. A NUL terminator lets
+# read preserve invalid UTF-8 bytes and every trailing newline that Bash can
+# represent.
+urldecode_into() {
+    local name="$1" raw="$2" py decoded
+    py="$(find_python)"
+    if [[ -n "$py" ]] && IFS= read -r -d '' decoded < <(
+        "$py" -c '
+import os
+import sys
+import urllib.parse
+
+raw = os.fsencode(sys.argv[1])
+decoded = urllib.parse.unquote_to_bytes(raw)
+# Bash variables cannot contain NUL. Keep that escape encoded instead of
+# silently truncating the path at the first decoded NUL.
+if b"\0" in decoded:
+    decoded = raw
+sys.stdout.buffer.write(decoded + b"\0")
+' "$raw" 2>/dev/null
+    ); then
+        printf -v "$name" '%s' "$decoded"
     else
-        # Leading component is a host name; drop it.
-        path="/${rest#*/}"
+        # Without a usable decoder, the still-percent-encoded value is safe and
+        # preserves the previous no-Python fallback.
+        printf -v "$name" '%s' "$raw"
     fi
-    urldecode "$path"
 }
 
-# Strip a trailing :line or :line:col suffix. The suffix is a display
-# convention from compilers and test runners, never part of the path the
-# px0 CLI accepts -- so strip it whenever the remainder is non-empty,
-# whether or not it exists yet (build artifacts get cleaned, broken
-# symlinks fail -e, files may be created next). An exact on-disk match
-# always wins first, so files genuinely ending in ":42" still open whole.
-strip_line_suffix() {
-    local t="$1" stripped
-    if [[ -e "$t" ]]; then
-        printf '%s' "$t"
-        return 0
+# Parse a px0:// or local file:// URL into URL_PATH. Numeric line and column
+# query parameters become the colon suffix understood by px0.
+url_to_target() {
+    local scheme="$1" url="$2" rest raw_path authority lower_authority
+    local query="" parameter remaining line="" col=""
+    rest="${url#*://}"
+    rest="${rest%%\#*}"
+    if [[ "$rest" == *\?* ]]; then
+        query="${rest#*\?}"
+        rest="${rest%%\?*}"
     fi
-    stripped="$t"
-    while [[ "$stripped" =~ ^(.*):[0-9]+$ ]]; do
-        stripped="${BASH_REMATCH[1]}"
-        if [[ -e "$stripped" ]]; then
-            printf '%s' "$stripped"
-            return 0
+
+    if [[ "$scheme" == "file" && "$rest" != /* ]]; then
+        authority="${rest%%/*}"
+        lower_authority="$(printf '%s' "$authority" | tr '[:upper:]' '[:lower:]')"
+        if [[ -n "$authority" && "$lower_authority" != "localhost" ]]; then
+            printf 'px0-open: refusing non-local file URI authority: %s\n' "$authority" >&2
+            return 1
         fi
+        if [[ "$rest" == */* ]]; then
+            raw_path="/${rest#*/}"
+        else
+            raw_path="/"
+        fi
+    else
+        # px0:// is a custom scheme: a non-slash target is a relative path, not
+        # an RFC host authority. file:/// paths also arrive here unchanged.
+        raw_path="$rest"
+    fi
+
+    urldecode_into URL_PATH "$raw_path" || return 1
+    remaining="$query"
+    while [[ -n "$remaining" ]]; do
+        parameter="${remaining%%&*}"
+        if [[ "$remaining" == *'&'* ]]; then
+            remaining="${remaining#*&}"
+        else
+            remaining=""
+        fi
+        case "$parameter" in
+            line=*) line="${parameter#line=}" ;;
+            col=*) col="${parameter#col=}" ;;
+        esac
     done
-    # Nothing on disk matched: peel :line/:line:col tails in a loop
-    # (greedy .+ would stop after one level) so px0 receives a clean
-    # path instead of "file:42:10".
-    while [[ "$t" =~ ^(.+):[0-9]+$ ]]; do
-        t="${BASH_REMATCH[1]}"
-    done
-    printf '%s' "$t"
+    if [[ "$line" =~ ^[0-9]+$ ]]; then
+        URL_PATH="$URL_PATH:$line"
+        if [[ "$col" =~ ^[0-9]+$ ]]; then
+            URL_PATH="$URL_PATH:$col"
+        fi
+    fi
 }
 
 main() {
@@ -146,8 +266,8 @@ main() {
             exit 2
             ;;
     esac
-    # A leading -- separates flags from the target so paths starting
-    # with - can be opened explicitly.
+    # A leading -- separates flags from the target so paths starting with - can
+    # be opened explicitly.
     if [[ "$1" == "--" ]]; then
         shift
         if [[ $# -lt 1 ]]; then
@@ -155,30 +275,45 @@ main() {
             exit 2
         fi
     fi
-    local target="$1" path scheme=""
-    # URL schemes are case-insensitive; only treat the target as a URL
-    # when it actually contains :// so files named e.g. "px0" still work.
+
+    local target="$1" path candidate scheme="" rc tilde="~"
+    local launch_log="$LOG_FILE"
+    # URL schemes are case-insensitive; only treat the target as a URL when it
+    # actually contains :// so files named e.g. "px0" still work.
     if [[ "$target" == *://* ]]; then
-        scheme="$(printf '%s' "${target%%://*}" | tr 'A-Z' 'a-z')"
+        scheme="$(printf '%s' "${target%%://*}" | tr '[:upper:]' '[:lower:]')"
     fi
 
     case "$scheme" in
         px0|file)
-            path="$(url_to_path "$target")"
+            url_to_target "$scheme" "$target" || exit 2
+            path="$URL_PATH"
             ;;
         *)
-            path="$target"
+            candidate="$target"
+            if [[ "$candidate" == "$tilde" ]]; then
+                candidate="$HOME"
+            elif [[ "${candidate:0:2}" == "$tilde/" ]]; then
+                candidate="$HOME/${candidate:2}"
+            fi
+            path="$candidate"
             ;;
     esac
 
     # Expand ~ and relative paths against the caller's cwd.
-    if [[ "$path" == "~/"* || "$path" == "~" ]]; then
-        path="${path/#\~/$HOME}"
+    if [[ "$path" == "$tilde" ]]; then
+        path="$HOME"
+    elif [[ "${path:0:2}" == "$tilde/" ]]; then
+        path="$HOME/${path:2}"
     elif [[ "$path" != /* ]]; then
         path="$PWD/$path"
     fi
 
-    path="$(strip_line_suffix "$path")"
+    if has_control_bytes "$path" "$(find_python)"; then
+        # Preserve the target bytes, but suppress px0 narration that could
+        # reproduce newlines or escapes in the shared log.
+        launch_log="/dev/null"
+    fi
 
     if [[ ! -x "$PX0_BIN" ]]; then
         printf 'px0-open: px0 binary not found at %s (set PX0_BIN)\n' "$PX0_BIN" >&2
@@ -186,12 +321,15 @@ main() {
     fi
 
     mkdir -p "$LOG_DIR" 2>/dev/null || true
-    trim_log
-    # Detached: the caller (terminal URL handler, Herdr action) returns
-    # immediately while px0 serves and opens the browser.
-    nohup "$PX0_BIN" "$path" >>"$LOG_FILE" 2>&1 &
-    disown 2>/dev/null || true
-    printf 'opening in px0: %s\n' "$path"
+    # Python's Popen error pipe reports exec failures synchronously, while
+    # start_new_session detaches a successfully started px0 from the caller's
+    # terminal and process group.
+    launch_px0 "$path" "$launch_log"
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        exit "$rc"
+    fi
+    printf 'opening in px0: %q\n' "$path"
 }
 
 main "$@"
