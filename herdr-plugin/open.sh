@@ -6,6 +6,26 @@
 # so this action returns immediately.
 set -u
 
+resolve_opener() {
+  local configured=""
+  if [[ -n "${PX0_OPEN_BIN:-}" ]]; then
+    printf '%s' "$PX0_OPEN_BIN"
+    return 0
+  fi
+  if [[ -n "${PX0_CLICK_PREFIX:-}" ]]; then
+    printf '%s/bin/px0-open' "$PX0_CLICK_PREFIX"
+    return 0
+  fi
+  if [[ -n "${HERDR_PLUGIN_CONFIG_DIR:-}" && -r "$HERDR_PLUGIN_CONFIG_DIR/px0-open-path" ]]; then
+    IFS= read -r configured <"$HERDR_PLUGIN_CONFIG_DIR/px0-open-path" || [[ -n "$configured" ]]
+    if [[ -n "$configured" ]]; then
+      printf '%s' "$configured"
+      return 0
+    fi
+  fi
+  printf '%s/.local/bin/px0-open' "$HOME"
+}
+
 url="${HERDR_PLUGIN_CLICKED_URL:-}"
 
 if [[ -z "$url" ]]; then
@@ -14,7 +34,7 @@ if [[ -z "$url" ]]; then
 fi
 
 scheme="${url%%://*}"
-scheme="$(printf '%s' "$scheme" | tr 'A-Z' 'a-z')"
+scheme="$(printf '%s' "$scheme" | tr '[:upper:]' '[:lower:]')"
 
 case "$scheme" in
   px0|file) ;;
@@ -24,10 +44,10 @@ case "$scheme" in
     ;;
 esac
 
-opener="${PX0_OPEN_BIN:-$HOME/.local/bin/px0-open}"
+opener="$(resolve_opener)"
 if [[ ! -x "$opener" ]]; then
   echo "px0-opener: helper not executable at $opener (set PX0_OPEN_BIN)" >&2
   exit 1
 fi
 
-exec "$opener" "$url"
+exec "$opener" -- "$url"

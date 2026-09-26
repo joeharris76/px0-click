@@ -5,8 +5,9 @@
 Make file paths printed in the terminal **Cmd/Ctrl-clickable to open in
 [px0](https://github.com/openai/px0)**, the terminal file browser. Works in
 [Ghostty](https://ghostty.org/) (Cmd+click) and
-[Herdr](https://herdr.dev/) (Ctrl+click), with line/column info carried
-through so `rg --vimgrep` matches open at the match.
+[Herdr](https://herdr.dev/) (Ctrl+click). Common line/column suffixes remain
+visible in terminal output; px0 opens the requested line and currently ignores
+the column.
 
 ## How it works
 
@@ -22,7 +23,7 @@ Three small pieces:
 | Piece | What it does |
 |---|---|
 | `bin/hyperlink-paths` | Stdin filter: wraps existing file paths in OSC 8 `px0://` hyperlinks. Visible text is byte-identical; only real files link (existence-checked by default). Handles `:line[:col]`, `~/`, relative paths, spaces, brackets, ANSI colors, unicode. |
-| `bin/px0-open` | Opens a path or `px0://`/`file://` URL in px0 (detached), normalizing `:line:col` suffixes, `~`, relative paths, and percent-encoding. |
+| `bin/px0-open` | Opens a path or local `px0://`/`file://` URL in px0 (detached), preserving numeric line/column locations while normalizing `~`, relative paths, and percent-encoding. Non-local `file://` authorities are rejected. |
 | `shell/px0-click.zsh` | zsh integration: `rg` emits native `px0://` hyperlinks on terminals; `px <path>` opens a path in px0, `px <cmd...>` runs any command through `hyperlink-paths` (exit status preserved). |
 
 Plus two optional integrations: a macOS `px0://` URL handler app
@@ -46,9 +47,15 @@ Pick pieces instead:
 ```sh
 ./install.sh --shell --herdr   # helpers always install; add shell + Herdr
 ./install.sh --url-handler     # just the macOS px0:// handler app
-./install.sh --prefix ~/.local # custom install prefix (default ~/.local)
-./install.sh --uninstall       # remove helpers + shell sourcing
+./install.sh --prefix ~/.local # custom prefix for helpers and integrations (default ~/.local)
+./install.sh --uninstall       # remove owned helpers + shell sourcing
 ```
+
+The installer refuses to overwrite or uninstall same-name helpers, shell files,
+URL-handler apps, or Herdr registrations that it does not recognize as
+px0-click-owned. Requested installation stages roll back together if one fails.
+A custom `--prefix` is recorded in the shell, Herdr, and macOS URL-handler
+integrations.
 
 Then open a new shell (or `source ~/.zshrc`). Restart the Herdr server once
 (`herdr quit`, then `herdr`) to pick up the plugin.
@@ -68,8 +75,8 @@ Then open a new shell (or `source ~/.zshrc`). Restart the Herdr server once
 ## Usage
 
 ```sh
-px0-open src/main.py:10:2        # open a path (line/col stripped for px0)
-px0-open 'px0:///abs/path?line=5' # open a px0:// URL (from clicks)
+px0-open src/main.py:10:2         # open at line 10 (px0 currently ignores column 2)
+px0-open 'px0:///abs/path?line=5' # open a px0:// URL at line 5
 
 rg --vimgrep TODO               # matches are clickable on terminals already
 px rg --vimgrep TODO            # same, explicit
@@ -80,9 +87,11 @@ px -- test                      # -- forces "run", never "open"
 git status --short | hyperlink-paths   # pipe anything manually
 ```
 
-Environment overrides: `PX0_BIN` (px0 binary), `PX0_PYTHON` (urldecode
-interpreter), `PX0_OPEN_LOG_DIR` (click log dir), `PX0_OPEN_BIN` (helper path
-for the Herdr plugin).
+Environment overrides: `PX0_BIN` (px0 binary), `PX0_PYTHON` (URI decoder),
+`PX0_OPEN_LOG_DIR` (click log dir), `PX0_OPEN_BIN` (exact helper path for Herdr
+or the macOS handler), and `PX0_CLICK_PREFIX` (Herdr helper prefix when no exact
+path is configured). Installer-managed Herdr and macOS integrations record the
+selected prefix automatically.
 
 ## Layout
 

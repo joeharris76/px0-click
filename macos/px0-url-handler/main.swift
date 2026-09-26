@@ -4,11 +4,21 @@ import AppKit
 // LaunchServices delivers clicked px0:// URLs via the Apple Event
 // application(_:open:) delegate callback (Command-line argv carries only
 // the binary path and possible -psn_* serial numbers, never the URL).
-// Each URL is forwarded to ~/.local/bin/px0-open, which normalizes it
-// and launches px0 detached.
+// Each URL is forwarded to the px0-open path stored in the app bundle by
+// install.sh, which normalizes it and launches px0 detached.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     static var opener: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        if let override = ProcessInfo.processInfo.environment["PX0_OPEN_BIN"], !override.isEmpty {
+            return URL(fileURLWithPath: override)
+        }
+        if let configuredURL = Bundle.main.url(forResource: "px0-open-path", withExtension: nil),
+           let configured = try? String(contentsOf: configuredURL, encoding: .utf8) {
+            let path = configured.hasSuffix("\n") ? String(configured.dropLast()) : configured
+            if !path.isEmpty {
+                return URL(fileURLWithPath: path)
+            }
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/bin/px0-open")
     }
 
@@ -30,7 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for url in urls {
             let proc = Process()
             proc.executableURL = Self.opener
-            proc.arguments = [url.absoluteString]
+            proc.arguments = ["--", url.absoluteString]
             // Detached: never block the event loop on px0.
             proc.standardOutput = FileHandle.nullDevice
             proc.standardError = FileHandle.nullDevice

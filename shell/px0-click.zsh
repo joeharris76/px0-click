@@ -14,8 +14,8 @@
 # See px0-open(1) and hyperlink-paths in ../bin (px0-click repo).
 
 # rg: clickable px0:// file hyperlinks on terminals, plain text otherwise.
-# The format carries ?line=&col= so vimgrep matches open at the match;
-# without line info rg substitutes 1/1, which just opens the file top.
+# The format keeps line/column metadata visible and px0-open translates the
+# query parameters into px0's path:line:column form.
 # An explicit user --hyperlink-format still wins (last flag wins in rg).
 if command -v rg >/dev/null 2>&1; then
     rg() {
@@ -32,8 +32,10 @@ fi
 # shell aliases do not resolve at runtime, so `px myalias` reports
 # "command not found" while `px myfunction` works.
 px() {
-    local base stream rc
-    stream=()
+    local base rc filter_dir stdout_fifo stderr_fifo stdout_pid stderr_pid
+    local -a stdout_stream stderr_stream
+    stdout_stream=()
+    stderr_stream=()
     if [[ $# -eq 0 ]]; then
         px0-open --help >&2
         return 2
@@ -49,38 +51,48 @@ px() {
             return 2
         fi
     elif [[ $# -eq 1 && "$1" != -* ]]; then
-        # A single path-like argument opens in px0 when it (or its
-        # :line/:line:col-suffixed base) exists. A :line or :line:col
-        # suffix still opens when the base path exists
-        # (px /tmp/demo.py:10); otherwise fall through and run it.
+        # A single path-like argument opens in px0 when it (or its numeric
+        # :line/:line:col-suffixed base) exists. An exact path wins first;
+        # otherwise only the documented numeric suffix forms are recognized.
         base="$1"
-        while [[ "$base" == *:[0-9]* && ! -e "$base" ]]; do
-            base="${base%:*}"
-        done
+        if [[ ! -e "$base" && "$base" =~ '^(.+):[0-9]+$' && -e "$match[1]" ]]; then
+            base="$match[1]"
+        elif [[ ! -e "$base" && "$base" =~ '^(.+):[0-9]+:[0-9]+$' ]]; then
+            base="$match[1]"
+        elif [[ ! -e "$base" && "$base" =~ '^(.+):[0-9]+$' ]]; then
+            base="$match[1]"
+        fi
         if [[ -e "$base" ]]; then
             px0-open "$1"
             return $?
         fi
     fi
-    # Both streams pass through hyperlink-paths (compilers print file
-    # paths on stderr too), but stderr stays on the terminal when the
-    # terminal is watching: `px cmd > file` keeps diagnostics visible
-    # instead of baking them into the file. When stderr is piped (Herdr
-    # panes, CI), both streams merge into the filter as before.
-    # The filter runs line-buffered (-u) on terminals so long-running
-    # commands stream live instead of appearing only at exit.
+    # Keep stdout and stderr on their original routes. Each stream gets its
+    # own filter, so explicit redirects such as `>out 2>err` remain separate
+    # while compiler diagnostics are still linkified. Use line buffering only
+    # for a stream whose destination is a terminal.
     if [[ -t 1 ]]; then
-        stream=(-u)
+        stdout_stream=(-u)
     fi
     if [[ -t 2 ]]; then
-        "$@" 2> >(hyperlink-paths $stream --base "$PWD" >&2) | hyperlink-paths $stream --base "$PWD"
-        # Capture here: the if/else wrapper itself resets $pipestatus,
-        # so reading it after fi would report the filter, not the command.
-        rc=${pipestatus[1]}
-    else
-        "$@" 2>&1 | hyperlink-paths --base "$PWD"
-        rc=${pipestatus[1]}
+        stderr_stream=(-u)
     fi
+    filter_dir=$(mktemp -d "${TMPDIR:-/tmp}/px0-click.XXXXXX") || return 1
+    stdout_fifo="$filter_dir/stdout"
+    stderr_fifo="$filter_dir/stderr"
+    if ! mkfifo "$stdout_fifo" "$stderr_fifo"; then
+        rm -rf "$filter_dir"
+        return 1
+    fi
+    hyperlink-paths "${stdout_stream[@]}" --base "$PWD" <"$stdout_fifo" &
+    stdout_pid=$!
+    hyperlink-paths "${stderr_stream[@]}" --base "$PWD" <"$stderr_fifo" >&2 &
+    stderr_pid=$!
+    "$@" >"$stdout_fifo" 2>"$stderr_fifo"
+    rc=$?
+    wait "$stdout_pid" 2>/dev/null || true
+    wait "$stderr_pid" 2>/dev/null || true
+    rm -rf "$filter_dir"
     # Report the wrapped command's status, not the filter's, so
     # `px rg pattern` still signals "no match" correctly.
     return $rc
