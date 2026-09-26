@@ -2,13 +2,19 @@ id = "joeharris76.px0-opener"
 name = "px0 Opener"
 version = "1.0.0"
 min_herdr_version = "0.7.0"
-description = "Open clicked px0:// and file:// links in the px0 file browser."
+description = "Open clicked px0:// and file:// links, or selected path text, in the px0 file browser."
 platforms = ["macos"]
 
 [[actions]]
 id = "open"
 title = "Open link in px0"
 command = ["bash", "open.sh"]
+
+[[actions]]
+id = "open-selected"
+title = "Open selected path in px0"
+contexts = ["pane"]
+command = ["bash", "open-selected.sh"]
 
 [[link_handlers]]
 id = "px0-scheme"
