@@ -1,5 +1,7 @@
 # px0-click
 
+> This project is brand new and 100% agent-created so far: ask your agent to validate it against your own setup before installing, so none of its changes clobber anything you care about.
+
 Make file paths printed in the terminal **Cmd/Ctrl-clickable to open in
 [px0](https://github.com/openai/px0)**, the terminal file browser. Works in
 [Ghostty](https://ghostty.org/) (Cmd+click) and
